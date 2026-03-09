@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,11 +18,12 @@ type Agent struct {
 }
 
 type Commit struct {
-	Hash       string    `json:"hash"`
-	ParentHash string    `json:"parent_hash"`
-	AgentID    string    `json:"agent_id"`
-	Message    string    `json:"message"`
-	CreatedAt  time.Time `json:"created_at"`
+	Hash         string    `json:"hash"`
+	ParentHash   string    `json:"parent_hash"`
+	ParentHashes []string  `json:"parent_hashes,omitempty"`
+	AgentID      string    `json:"agent_id"`
+	Message      string    `json:"message"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type Channel struct {
@@ -85,6 +87,14 @@ func (d *DB) Migrate() error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 
+		CREATE TABLE IF NOT EXISTS commit_parents (
+			commit_hash TEXT NOT NULL REFERENCES commits(hash) ON DELETE CASCADE,
+			parent_hash TEXT NOT NULL,
+			parent_index INTEGER NOT NULL,
+			PRIMARY KEY (commit_hash, parent_index),
+			UNIQUE (commit_hash, parent_hash)
+		);
+
 		CREATE TABLE IF NOT EXISTS channels (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT UNIQUE NOT NULL,
@@ -111,8 +121,15 @@ func (d *DB) Migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash);
 		CREATE INDEX IF NOT EXISTS idx_commits_agent ON commits(agent_id);
+		CREATE INDEX IF NOT EXISTS idx_commit_parents_parent ON commit_parents(parent_hash);
+		CREATE INDEX IF NOT EXISTS idx_commit_parents_commit ON commit_parents(commit_hash, parent_index);
 		CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id);
 		CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(parent_id);
+
+		INSERT OR IGNORE INTO commit_parents (commit_hash, parent_hash, parent_index)
+		SELECT hash, parent_hash, 0
+		FROM commits
+		WHERE parent_hash IS NOT NULL AND parent_hash <> '';
 	`)
 	return err
 }
@@ -146,27 +163,73 @@ func (d *DB) GetAgentByID(id string) (*Agent, error) {
 
 // --- Commits ---
 
-func (d *DB) InsertCommit(hash, parentHash, agentID, message string) error {
-	_, err := d.db.Exec(
+func (d *DB) InsertCommit(hash string, parentHashes []string, agentID, message string) error {
+	primaryParent := firstParent(parentHashes)
+	var agentValue any
+	if agentID != "" {
+		agentValue = agentID
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
 		"INSERT INTO commits (hash, parent_hash, agent_id, message) VALUES (?, ?, ?, ?)",
-		hash, parentHash, agentID, message,
-	)
-	return err
+		hash, primaryParent, agentValue, message,
+	); err != nil {
+		return err
+	}
+	if err := insertCommitParents(tx, hash, parentHashes); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) SyncCommitParents(hash string, parentHashes []string) error {
+	primaryParent := firstParent(parentHashes)
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE commits SET parent_hash = ? WHERE hash = ?", primaryParent, hash); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM commit_parents WHERE commit_hash = ?", hash); err != nil {
+		return err
+	}
+	if err := insertCommitParents(tx, hash, parentHashes); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) GetCommit(hash string) (*Commit, error) {
 	var c Commit
 	var parentHash sql.NullString
+	var agentID sql.NullString
 	err := d.db.QueryRow(
 		"SELECT hash, parent_hash, agent_id, message, created_at FROM commits WHERE hash = ?", hash,
-	).Scan(&c.Hash, &parentHash, &c.AgentID, &c.Message, &c.CreatedAt)
+	).Scan(&c.Hash, &parentHash, &agentID, &c.Message, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	if parentHash.Valid {
 		c.ParentHash = parentHash.String
 	}
-	return &c, err
+	if agentID.Valid {
+		c.AgentID = agentID.String
+	}
+	if err := d.populateParentHashes(&c); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (d *DB) ListCommits(agentID string, limit, offset int) ([]Commit, error) {
@@ -190,34 +253,64 @@ func (d *DB) ListCommits(agentID string, limit, offset int) ([]Commit, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.populateParentHashesFor(commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
 }
 
 func (d *DB) GetChildren(hash string) ([]Commit, error) {
 	rows, err := d.db.Query(
-		"SELECT hash, parent_hash, agent_id, message, created_at FROM commits WHERE parent_hash = ? ORDER BY created_at DESC",
+		`SELECT DISTINCT c.hash, c.parent_hash, c.agent_id, c.message, c.created_at
+		 FROM commits c
+		 JOIN commit_parents cp ON cp.commit_hash = c.hash
+		 WHERE cp.parent_hash = ?
+		 ORDER BY c.created_at DESC`,
 		hash,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.populateParentHashesFor(commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
 }
 
 func (d *DB) GetLineage(hash string) ([]Commit, error) {
 	var lineage []Commit
-	current := hash
-	for current != "" {
+	queue := []string{hash}
+	seen := map[string]bool{}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current == "" || seen[current] {
+			continue
+		}
+		seen[current] = true
+
 		c, err := d.GetCommit(current)
 		if err != nil {
 			return lineage, err
 		}
 		if c == nil {
-			break
+			continue
 		}
 		lineage = append(lineage, *c)
-		current = c.ParentHash
+		for _, parentHash := range c.ParentHashes {
+			if parentHash != "" && !seen[parentHash] {
+				queue = append(queue, parentHash)
+			}
+		}
 	}
 	return lineage, nil
 }
@@ -226,15 +319,126 @@ func (d *DB) GetLeaves() ([]Commit, error) {
 	rows, err := d.db.Query(`
 		SELECT c.hash, c.parent_hash, c.agent_id, c.message, c.created_at
 		FROM commits c
-		LEFT JOIN commits child ON child.parent_hash = c.hash
-		WHERE child.hash IS NULL
+			LEFT JOIN commit_parents child ON child.parent_hash = c.hash
+			WHERE child.commit_hash IS NULL
 		ORDER BY c.created_at DESC
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.populateParentHashesFor(commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
+}
+
+func insertCommitParents(tx *sql.Tx, hash string, parentHashes []string) error {
+	for i, parentHash := range parentHashes {
+		if parentHash == "" {
+			continue
+		}
+		if _, err := tx.Exec(
+			"INSERT INTO commit_parents (commit_hash, parent_hash, parent_index) VALUES (?, ?, ?)",
+			hash, parentHash, i,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func firstParent(parentHashes []string) string {
+	for _, parentHash := range parentHashes {
+		if parentHash != "" {
+			return parentHash
+		}
+	}
+	return ""
+}
+
+func (d *DB) populateParentHashes(c *Commit) error {
+	parents, err := d.getParentHashes(c.Hash)
+	if err != nil {
+		return err
+	}
+	if len(parents) == 0 && c.ParentHash != "" {
+		parents = []string{c.ParentHash}
+	}
+	c.ParentHashes = parents
+	if c.ParentHash == "" {
+		c.ParentHash = firstParent(parents)
+	}
+	return nil
+}
+
+func (d *DB) populateParentHashesFor(commits []Commit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+	hashes := make([]string, 0, len(commits))
+	for _, c := range commits {
+		hashes = append(hashes, c.Hash)
+	}
+	parentMap, err := d.getParentHashesMap(hashes)
+	if err != nil {
+		return err
+	}
+	for i := range commits {
+		parents := parentMap[commits[i].Hash]
+		if len(parents) == 0 && commits[i].ParentHash != "" {
+			parents = []string{commits[i].ParentHash}
+		}
+		commits[i].ParentHashes = parents
+		if commits[i].ParentHash == "" {
+			commits[i].ParentHash = firstParent(parents)
+		}
+	}
+	return nil
+}
+
+func (d *DB) getParentHashes(hash string) ([]string, error) {
+	parentMap, err := d.getParentHashesMap([]string{hash})
+	if err != nil {
+		return nil, err
+	}
+	return parentMap[hash], nil
+}
+
+func (d *DB) getParentHashesMap(hashes []string) (map[string][]string, error) {
+	parentMap := make(map[string][]string, len(hashes))
+	if len(hashes) == 0 {
+		return parentMap, nil
+	}
+	placeholders := make([]string, len(hashes))
+	args := make([]any, len(hashes))
+	for i, hash := range hashes {
+		placeholders[i] = "?"
+		args[i] = hash
+	}
+	rows, err := d.db.Query(
+		fmt.Sprintf(
+			"SELECT commit_hash, parent_hash FROM commit_parents WHERE commit_hash IN (%s) ORDER BY commit_hash, parent_index",
+			strings.Join(placeholders, ","),
+		),
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var commitHash, parentHash string
+		if err := rows.Scan(&commitHash, &parentHash); err != nil {
+			return nil, err
+		}
+		parentMap[commitHash] = append(parentMap[commitHash], parentHash)
+	}
+	return parentMap, rows.Err()
 }
 
 func scanCommits(rows *sql.Rows) ([]Commit, error) {
@@ -242,11 +446,15 @@ func scanCommits(rows *sql.Rows) ([]Commit, error) {
 	for rows.Next() {
 		var c Commit
 		var parentHash sql.NullString
-		if err := rows.Scan(&c.Hash, &parentHash, &c.AgentID, &c.Message, &c.CreatedAt); err != nil {
+		var agentID sql.NullString
+		if err := rows.Scan(&c.Hash, &parentHash, &agentID, &c.Message, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		if parentHash.Valid {
 			c.ParentHash = parentHash.String
+		}
+		if agentID.Valid {
+			c.AgentID = agentID.String
 		}
 		commits = append(commits, c)
 	}

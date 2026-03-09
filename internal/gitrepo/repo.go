@@ -106,29 +106,25 @@ func (r *Repo) CommitExists(hash string) bool {
 	return err == nil
 }
 
-// GetCommitInfo returns the parent hash(es) and subject of a commit.
-func (r *Repo) GetCommitInfo(hash string) (parentHash, message string, err error) {
+// GetCommitInfo returns the parent hashes and subject of a commit.
+func (r *Repo) GetCommitInfo(hash string) (parentHashes []string, message string, err error) {
 	if !IsValidHash(hash) {
-		return "", "", fmt.Errorf("invalid hash: %s", hash)
+		return nil, "", fmt.Errorf("invalid hash: %s", hash)
 	}
 	// Use NUL byte separator to avoid ambiguity with empty parent lines
 	out, err := r.gitOutput("log", "-1", "--format=%P%x00%s", hash)
 	if err != nil {
-		return "", "", fmt.Errorf("git log: %w", err)
+		return nil, "", fmt.Errorf("git log: %w", err)
 	}
 	out = strings.TrimRight(out, "\n")
 	parts := strings.SplitN(out, "\x00", 2)
 	if len(parts) >= 1 {
-		// First parent only (ignore merge parents for now)
-		parents := strings.Fields(parts[0])
-		if len(parents) > 0 {
-			parentHash = parents[0]
-		}
+		parentHashes = strings.Fields(parts[0])
 	}
 	if len(parts) >= 2 {
 		message = parts[1]
 	}
-	return parentHash, message, nil
+	return parentHashes, message, nil
 }
 
 // Diff returns the diff between two commits.

@@ -61,15 +61,82 @@ func TestUnbundleWithRelativeBareRepoPath(t *testing.T) {
 		t.Fatalf("expected commit %s to exist in bare repo", headHash)
 	}
 
-	parent, message, err := repo.GetCommitInfo(headHash)
+	parents, message, err := repo.GetCommitInfo(headHash)
 	if err != nil {
 		t.Fatalf("get commit info: %v", err)
 	}
-	if parent != "" {
-		t.Fatalf("expected root commit with empty parent, got %q", parent)
+	if len(parents) != 0 {
+		t.Fatalf("expected root commit with no parents, got %v", parents)
 	}
 	if message != "test bundle import" {
 		t.Fatalf("unexpected commit message: got %q", message)
+	}
+}
+
+func TestGetCommitInfoReturnsAllMergeParents(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+
+	runGit(t, worktree, "init")
+	runGit(t, worktree, "config", "user.name", "Test Bot")
+	runGit(t, worktree, "config", "user.email", "test-bot@example.com")
+
+	rootFilePath := filepath.Join(worktree, "root.txt")
+	if err := os.WriteFile(rootFilePath, []byte("root\n"), 0o644); err != nil {
+		t.Fatalf("write demo file: %v", err)
+	}
+	runGit(t, worktree, "add", "root.txt")
+	runGit(t, worktree, "commit", "-m", "root")
+
+	runGit(t, worktree, "switch", "-c", "alpha")
+	alphaFilePath := filepath.Join(worktree, "alpha.txt")
+	if err := os.WriteFile(alphaFilePath, []byte("alpha\n"), 0o644); err != nil {
+		t.Fatalf("write alpha file: %v", err)
+	}
+	runGit(t, worktree, "add", "alpha.txt")
+	runGit(t, worktree, "commit", "-m", "alpha")
+	alphaHash := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
+
+	runGit(t, worktree, "switch", "-c", "beta", "HEAD~1")
+	betaFilePath := filepath.Join(worktree, "beta.txt")
+	if err := os.WriteFile(betaFilePath, []byte("beta\n"), 0o644); err != nil {
+		t.Fatalf("write beta file: %v", err)
+	}
+	runGit(t, worktree, "add", "beta.txt")
+	runGit(t, worktree, "commit", "-m", "beta")
+	betaHash := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
+
+	runGit(t, worktree, "switch", "alpha")
+	runGit(t, worktree, "merge", "--no-ff", "beta", "-m", "merge alpha beta")
+	mergeHash := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
+
+	repoPath := filepath.Join(root, "hub.git")
+	repo, err := Init(repoPath)
+	if err != nil {
+		t.Fatalf("init bare repo: %v", err)
+	}
+	bundlePath := filepath.Join(root, "merge.bundle")
+	runGit(t, worktree, "bundle", "create", bundlePath, "HEAD")
+	if _, err := repo.Unbundle(bundlePath); err != nil {
+		t.Fatalf("unbundle merge bundle: %v", err)
+	}
+
+	parents, message, err := repo.GetCommitInfo(mergeHash)
+	if err != nil {
+		t.Fatalf("get merge commit info: %v", err)
+	}
+	if len(parents) != 2 || parents[0] != alphaHash || parents[1] != betaHash {
+		t.Fatalf("unexpected merge parents: got %v want [%s %s]", parents, alphaHash, betaHash)
+	}
+	if message != "merge alpha beta" {
+		t.Fatalf("unexpected merge message: got %q", message)
 	}
 }
 

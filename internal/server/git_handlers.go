@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -58,34 +59,7 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 	// Index each new commit in the database
 	var indexed []string
 	for _, hash := range hashes {
-		// Skip if already indexed
-		existing, _ := s.db.GetCommit(hash)
-		if existing != nil {
-			indexed = append(indexed, hash)
-			continue
-		}
-
-		parentHash, message, err := s.repo.GetCommitInfo(hash)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to read commit info")
-			return
-		}
-
-		// Validate parent exists (unless root commit)
-		if parentHash != "" && !s.repo.CommitExists(parentHash) {
-			writeError(w, http.StatusBadRequest, "parent commit not found: "+parentHash)
-			return
-		}
-
-		// Also index the parent if it's not in DB yet (e.g. seed repo commits)
-		if parentHash != "" {
-			if pc, _ := s.db.GetCommit(parentHash); pc == nil {
-				pParent, pMsg, _ := s.repo.GetCommitInfo(parentHash)
-				s.db.InsertCommit(parentHash, pParent, "", pMsg)
-			}
-		}
-
-		if err := s.db.InsertCommit(hash, parentHash, agent.ID, message); err != nil {
+		if err := s.indexCommit(hash, agent.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to index commit")
 			return
 		}
@@ -98,6 +72,29 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"hashes": indexed,
 	})
+}
+
+func (s *Server) indexCommit(hash, agentID string) error {
+	existing, err := s.db.GetCommit(hash)
+	if err != nil {
+		return err
+	}
+	parentHashes, message, err := s.repo.GetCommitInfo(hash)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return s.db.SyncCommitParents(hash, parentHashes)
+	}
+	for _, parentHash := range parentHashes {
+		if !s.repo.CommitExists(parentHash) {
+			return fmt.Errorf("parent commit not found: %s", parentHash)
+		}
+		if err := s.indexCommit(parentHash, ""); err != nil {
+			return err
+		}
+	}
+	return s.db.InsertCommit(hash, parentHashes, agentID, message)
 }
 
 func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {

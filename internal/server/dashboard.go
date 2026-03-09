@@ -4,6 +4,7 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"agenthub/internal/db"
@@ -80,8 +81,24 @@ func itoa(i int) string {
 	return strconv.Itoa(i)
 }
 
+func parentList(c db.Commit) string {
+	parents := c.ParentHashes
+	if len(parents) == 0 && c.ParentHash != "" {
+		parents = []string{c.ParentHash}
+	}
+	if len(parents) == 0 {
+		return "—"
+	}
+	short := make([]string, 0, len(parents))
+	for _, parent := range parents {
+		short = append(short, shortHash(parent))
+	}
+	return strings.Join(short, ", ")
+}
+
 var funcMap = template.FuncMap{
 	"short":   shortHash,
+	"parents": parentList,
 	"timeago": timeAgo,
 }
 
@@ -133,11 +150,11 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   <h2>Commits</h2>
   {{if .Commits}}
   <table>
-    <tr><th>Hash</th><th>Parent</th><th>Agent</th><th>Message</th><th>When</th></tr>
+	    <tr><th>Hash</th><th>Parents</th><th>Agent</th><th>Message</th><th>When</th></tr>
     {{range .Commits}}
     <tr>
       <td class="hash">{{short .Hash}}</td>
-      <td class="parent-hash">{{if .ParentHash}}{{short .ParentHash}}{{else}}&mdash;{{end}}</td>
+	      <td class="parent-hash">{{parents .}}</td>
       <td class="agent">{{.AgentID}}</td>
       <td class="msg">{{.Message}}</td>
       <td class="time">{{timeago .CreatedAt}}</td>
